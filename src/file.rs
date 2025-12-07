@@ -42,37 +42,68 @@ pub extern "C" fn age_encrypt_to_file(
     };
 
     // Parse recipients - could be a file path or a direct recipient key
-    let recipients: Vec<Box<dyn age::Recipient + Send>> = if recipient_str.starts_with("age1") {
-        match recipient_str.parse::<age::x25519::Recipient>() {
-            Ok(r) => vec![Box::new(r)],
-            Err(_) => return AgeResult::InvalidRecipient,
-        }
-    } else if recipient_str.starts_with("ssh-") {
-        match recipient_str.parse::<age::ssh::Recipient>() {
-            Ok(r) => vec![Box::new(r)],
-            Err(_) => return AgeResult::InvalidRecipient,
-        }
-    } else {
-        let contents = match std::fs::read_to_string(recipient_str) {
-            Ok(s) => s,
-            Err(_) => return AgeResult::IoError,
-        };
+    // Supports: x25519 (age1...), plugin (age1<plugin>1...), and ssh (ssh-...)
+    let mut recipients: Vec<Box<dyn age::Recipient + Send>> = Vec::new();
+    let mut plugin_recipients: Vec<age::plugin::Recipient> = Vec::new();
 
-        contents
-            .lines()
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-            .filter_map(|line| {
-                let line = line.trim();
-                if let Ok(r) = line.parse::<age::x25519::Recipient>() {
-                    return Some(Box::new(r) as Box<dyn age::Recipient + Send>);
-                }
-                if let Ok(r) = line.parse::<age::ssh::Recipient>() {
-                    return Some(Box::new(r) as Box<dyn age::Recipient + Send>);
-                }
-                None
-            })
-            .collect()
+    let recipient_lines: Vec<&str> = if recipient_str.starts_with("age1") || recipient_str.starts_with("ssh-") {
+        vec![recipient_str]
+    } else {
+        // Assume it's a file path containing recipients
+        match std::fs::read_to_string(recipient_str) {
+            Ok(contents) => {
+                // We need to own the string for the lines
+                let contents_leaked: &'static str = Box::leak(contents.into_boxed_str());
+                contents_leaked
+                    .lines()
+                    .filter(|line| !line.starts_with('#') && !line.is_empty())
+                    .map(|line| line.trim())
+                    .collect()
+            }
+            Err(_) => return AgeResult::IoError,
+        }
     };
+
+    for line in recipient_lines {
+        // Try x25519 first
+        if let Ok(r) = line.parse::<age::x25519::Recipient>() {
+            recipients.push(Box::new(r));
+            continue;
+        }
+        // Then try plugin recipient - collect these separately
+        if let Ok(r) = line.parse::<age::plugin::Recipient>() {
+            plugin_recipients.push(r);
+            continue;
+        }
+        // Finally try SSH
+        if let Ok(r) = line.parse::<age::ssh::Recipient>() {
+            recipients.push(Box::new(r));
+            continue;
+        }
+        // Skip unrecognized lines
+    }
+
+    // Create plugin recipients wrapper if we have any plugin recipients
+    // Group them by plugin name
+    if !plugin_recipients.is_empty() {
+        use std::collections::HashMap;
+        let mut by_plugin: HashMap<String, Vec<age::plugin::Recipient>> = HashMap::new();
+        for r in plugin_recipients {
+            by_plugin.entry(r.plugin().to_string()).or_default().push(r);
+        }
+
+        for (plugin_name, plugin_recs) in by_plugin {
+            match age::plugin::RecipientPluginV1::new(
+                &plugin_name,
+                &plugin_recs,
+                &[],
+                age::NoCallbacks,
+            ) {
+                Ok(plugin) => recipients.push(Box::new(plugin)),
+                Err(_) => return AgeResult::InvalidRecipient,
+            }
+        }
+    }
 
     if recipients.is_empty() {
         return AgeResult::InvalidRecipient;
@@ -146,6 +177,11 @@ pub extern "C" fn age_encrypt_to_file_armor(
 }
 
 /// Decrypt data from a file using an identity file.
+///
+/// This function supports all identity types including:
+/// - Standard x25519 identities (AGE-SECRET-KEY-...)
+/// - SSH identities
+/// - Plugin identities (AGE-PLUGIN-...)
 #[no_mangle]
 pub extern "C" fn age_decrypt_file(
     encrypted_path: *const c_char,
@@ -166,20 +202,18 @@ pub extern "C" fn age_decrypt_file(
         Err(e) => return e,
     };
 
-    let identity_contents = match std::fs::read_to_string(identity_path) {
-        Ok(s) => s,
+    // Use IdentityFile to parse the identity file - this supports all identity types
+    // including plugin identities (AGE-PLUGIN-...)
+    let identity_file = match age::IdentityFile::from_file(identity_path.to_string()) {
+        Ok(f) => f,
         Err(_) => return AgeResult::IoError,
     };
 
-    let identities: Vec<Box<dyn age::Identity>> = identity_contents
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.is_empty())
-        .filter_map(|line| {
-            age::x25519::Identity::from_str(line.trim())
-                .ok()
-                .map(|i| Box::new(i) as Box<dyn age::Identity>)
-        })
-        .collect();
+    // Get all identities from the file
+    let identities = match identity_file.into_identities() {
+        Ok(ids) => ids,
+        Err(_) => return AgeResult::InvalidIdentity,
+    };
 
     if identities.is_empty() {
         return AgeResult::InvalidIdentity;
@@ -196,7 +230,7 @@ pub extern "C" fn age_decrypt_file(
     };
 
     let mut decrypted = Vec::new();
-    let mut reader = match decryptor.decrypt(identities.iter().map(|i| i.as_ref())) {
+    let mut reader = match decryptor.decrypt(identities.iter().map(|i| i.as_ref() as &dyn age::Identity)) {
         Ok(r) => r,
         Err(_) => return AgeResult::DecryptionFailed,
     };
